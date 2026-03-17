@@ -14,8 +14,11 @@ Output structure:
 """
 from __future__ import annotations
 
+import os
 import re
 import sys
+import time
+from multiprocessing import Pool
 from pathlib import Path
 
 try:
@@ -82,6 +85,20 @@ def convert_file(eml_path: Path, output_path: Path) -> None:
     weasyprint.HTML(string=html, base_url=str(eml_path.parent)).write_pdf(str(output_path))
 
 
+def _process_one(args: tuple[str, str, str]) -> tuple[str, str | None, str | None]:
+    """
+    Worker function for multiprocessing.
+    Accepts and returns plain strings so the arguments are picklable.
+    Returns (eml_name, relative_pdf_path | None, error | None).
+    """
+    eml_str, output_str, pdf_label = args
+    try:
+        convert_file(Path(eml_str), Path(output_str))
+        return (Path(eml_str).name, pdf_label, None)
+    except Exception as exc:
+        return (Path(eml_str).name, None, str(exc))
+
+
 def main() -> None:
     project_root = Path(__file__).parent
     flights_dir = project_root / "flights"
@@ -96,9 +113,8 @@ def main() -> None:
         print("No .eml files found in the flights folder.")
         sys.exit(0)
 
-    print(f"Found {len(eml_files)} EML file(s). Converting...\n")
-
-    success = 0
+    # Build the list of jobs, skipping files that don't match the pattern
+    jobs: list[tuple[str, str, str]] = []
     skipped = 0
 
     for eml_file in eml_files:
@@ -115,15 +131,31 @@ def main() -> None:
 
         pdf_name = make_pdf_name(info)
         output_path = subfolder / pdf_name
+        pdf_label = f"{info['flight_date']}/{pdf_name}"
 
-        try:
-            convert_file(eml_file, output_path)
-            print(f"  OK    {info['flight_date']}/{pdf_name}")
-            success += 1
-        except Exception as exc:
-            print(f"  FAIL  {eml_file.name}: {exc}")
+        jobs.append((str(eml_file), str(output_path), pdf_label))
 
-    print(f"\nDone: {success} converted, {skipped} skipped.")
+    if not jobs:
+        print("No matching files to convert.")
+        sys.exit(0)
+
+    workers = min(len(jobs), os.cpu_count() or 4)
+    print(f"Found {len(jobs)} file(s) to convert ({skipped} skipped).")
+    print(f"Using {workers} parallel workers on {os.cpu_count()} cores...\n")
+
+    start = time.perf_counter()
+
+    success = 0
+    with Pool(processes=workers) as pool:
+        for eml_name, pdf_label, error in pool.imap_unordered(_process_one, jobs):
+            if error:
+                print(f"  FAIL  {eml_name}: {error}")
+            else:
+                print(f"  OK    {pdf_label}")
+                success += 1
+
+    elapsed = time.perf_counter() - start
+    print(f"\nDone: {success} converted, {skipped} skipped in {elapsed:.1f}s.")
     if success:
         print(f"Output: {output_root}/")
 

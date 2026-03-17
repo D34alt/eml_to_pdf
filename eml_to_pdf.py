@@ -8,8 +8,11 @@ from __future__ import annotations
 import argparse
 import email
 import email.policy
+import os
 import sys
+import time
 from email.utils import parsedate_to_datetime
+from multiprocessing import Pool
 from pathlib import Path
 
 
@@ -220,13 +223,11 @@ def build_html(msg: email.message.EmailMessage) -> str:
 </html>"""
 
 
-def convert(eml_path: Path, output_path: Path | None = None) -> Path:
-    """
-    Convert a single EML file to PDF.
-    Returns the path to the generated PDF.
-    """
+def _ensure_weasyprint():
+    """Import weasyprint or exit with a helpful message."""
     try:
         import weasyprint
+        return weasyprint
     except ImportError:
         print(
             "Error: weasyprint is not installed.\n"
@@ -236,6 +237,14 @@ def convert(eml_path: Path, output_path: Path | None = None) -> Path:
             "\nNote: on macOS, run the script with /opt/homebrew/bin/python3 to avoid SIP library issues."
         )
         sys.exit(1)
+
+
+def convert(eml_path: Path, output_path: Path | None = None) -> Path:
+    """
+    Convert a single EML file to PDF.
+    Returns the path to the generated PDF.
+    """
+    weasyprint = _ensure_weasyprint()
 
     if not eml_path.exists():
         raise FileNotFoundError(f"File not found: {eml_path}")
@@ -250,6 +259,21 @@ def convert(eml_path: Path, output_path: Path | None = None) -> Path:
         str(output_path)
     )
     return output_path
+
+
+def _batch_worker(args: tuple[str, str]) -> tuple[str, str, str | None]:
+    """
+    Worker function for multiprocessing in batch mode.
+    Accepts and returns plain strings so the arguments are picklable.
+    Returns (eml_name, pdf_name, error | None).
+    """
+    eml_str, out_str = args
+    eml_path = Path(eml_str)
+    try:
+        convert(eml_path, Path(out_str))
+        return (eml_path.name, Path(out_str).name, None)
+    except Exception as exc:
+        return (eml_path.name, "", str(exc))
 
 
 def main() -> None:
@@ -286,18 +310,29 @@ def main() -> None:
             print(f"No .eml files found in '{args.batch}'.")
             sys.exit(0)
 
-        print(f"Converting {len(eml_files)} EML file(s) in '{batch_dir}'...")
-        success = 0
-        for eml_file in eml_files:
-            try:
-                out = convert(eml_file)
-                success += 1
-                if args.verbose:
-                    print(f"  OK  {eml_file.name}  ->  {out.name}")
-            except Exception as exc:
-                print(f"  FAIL  {eml_file.name}: {exc}")
+        workers = min(len(eml_files), os.cpu_count() or 4)
+        print(
+            f"Converting {len(eml_files)} EML file(s) in '{batch_dir}' "
+            f"using {workers} parallel workers..."
+        )
 
-        print(f"\nDone: {success}/{len(eml_files)} converted successfully.")
+        start = time.perf_counter()
+        success = 0
+
+        # Build (input, output) string pairs for the pool
+        jobs = [(str(f), str(f.with_suffix(".pdf"))) for f in eml_files]
+
+        with Pool(processes=workers) as pool:
+            for eml_name, pdf_name, error in pool.imap_unordered(_batch_worker, jobs):
+                if error:
+                    print(f"  FAIL  {eml_name}: {error}")
+                else:
+                    success += 1
+                    if args.verbose:
+                        print(f"  OK  {eml_name}  ->  {pdf_name}")
+
+        elapsed = time.perf_counter() - start
+        print(f"\nDone: {success}/{len(eml_files)} converted successfully in {elapsed:.1f}s.")
 
     elif args.input:
         eml_path = Path(args.input)
